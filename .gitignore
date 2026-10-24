@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+config.yaml
+runs/
+state/
+tests/.tmp*/
+tools/
+.venv-pi/
