@@ -132,3 +132,7 @@ samma state-katalog. Kör en analys åt gången på Pi:n med 1 GB RAM.
 Kör på Raspberry Pi: `PYTHONDONTWRITEBYTECODE=1 .venv-pi/bin/python -m unittest discover -s tests -v`.
 Testerna använder tillfälliga filer under tests och simulerar ommontering och
 Signal. Ett riktigt modelltest behövs också för att kontrollera inferensmiljön.
+
+## Utveckling
+
+Codex har gjort mesta jobbet via codex cli på en laptop. Montering av rpi projektmapp har gjorts med sshfs - `sshfs user@rpi:/home/user/video_analyzer /home/user/rpi-project -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3`
