@@ -39,6 +39,32 @@ delar av monitorn körs som den vanliga användaren. Starta inte hela analysprog
 monteringsbehörigheter. Anpassa monteringskommandot till din befintliga miljö.
 Avbildningen monteras skrivskyddad. Ingen film läses medan ommontering pågår.
 
+## USB-gadget-tjänst
+
+Projektet innehåller systemd-enhetsfilen [`systemd/usb-gadget.service`](systemd/usb-gadget.service)
+och dess startskript [`systemd/usb_gadget_start.sh`](systemd/usb_gadget_start.sh).
+Tjänsten exponerar diskavbildningen `/video/virtual_disk.img` som USB-masslagring.
+Startskriptet använder ConfigFS, en loop-enhet och USB Device Controller (UDC);
+systemd kör tjänsten som root. Skriptet förutsätter att avbildningen finns på
+den angivna sökvägen.
+
+Från projektkatalogen på Raspberry Pi:n installeras eller uppdateras båda filerna
+med:
+
+```sh
+sudo install -m 755 systemd/usb_gadget_start.sh /usr/local/bin/usb_gadget_start.sh
+sudo install -m 644 systemd/usb-gadget.service /etc/systemd/system/usb-gadget.service
+sudo systemctl daemon-reload
+```
+
+Aktivera vid uppstart med
+`sudo systemctl enable usb-gadget.service`; starta eller starta om med
+`sudo systemctl start usb-gadget.service` respektive
+`sudo systemctl restart usb-gadget.service`. Kontrollera den med
+`systemctl status usb-gadget.service`. Denna projektfil dokumenterar enheten;
+att lägga till filerna i projektet ändrar inte automatiskt den installerade
+systemd-konfigurationen.
+
 ## Lokal installation av signal-cli
 
 signal-cli 0.14.9 är installerat i `tools/signal-cli-native` från
