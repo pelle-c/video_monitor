@@ -1,0 +1,2 @@
+# Inference dependencies belong to the existing video_analyzer environment.
+PyYAML>=6.0,<7

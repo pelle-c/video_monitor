@@ -1,0 +1,37 @@
+# Relative filesystem paths are resolved against this file.
+# Commands run in the project directory, without a shell or automatic sudo.
+watch:
+  path: /mnt/video
+  scan_seconds: 10
+  stable_seconds: 30
+  recursive: true
+
+mount:
+  remount_command: ["/bin/bash", "remount.sh", "/video/virtual_disk.img", "{mountpoint}"]
+  interval_seconds: 60
+  timeout_seconds: 30
+
+analysis:
+  model: runs/detect/train-8/weights/best.pt
+  data: ""
+  confidence: 0.45
+  min_object_hits: 3
+  max_bad_frames: 25
+  threads: 1
+  iou: 0.7
+  timeout_seconds: 1800
+  max_attempts: 3
+
+signal:
+  # Set group_id to the group ID copied from signal-cli listGroups.
+  group_id: "GnZ32dWODDI1g1RpbMGUTBmM1o9NdI8JPD6nZ5uo/p8="
+  command: ["./tools/signal-cli", "-a", "+46700000000", "send", "-g", "{group_id}", "-m", "{message}", "-a", "{image}"]
+  timeout_seconds: 120
+
+storage:
+  path: state
+  max_spool_mb: 256
+
+retry:
+  initial_seconds: 30
+  maximum_seconds: 3600
