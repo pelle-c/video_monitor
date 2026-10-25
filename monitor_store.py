@@ -93,9 +93,11 @@ class Store:
         with self.db:
             if images:
                 for name, image in images.items():
+                    message = (f"Inga objekt identifierades i {video_name}"
+                               if name == "no_objects" else f"{name} — {video_name}")
                     self.db.execute("""INSERT OR IGNORE INTO deliveries
                         (job_id,object_name,image,message) VALUES (?,?,?,?)""",
-                                    (key, name, image, f"{name} — {video_name}"))
+                                    (key, name, image, message))
             else:
                 self.db.execute("""INSERT OR IGNORE INTO deliveries
                     (job_id,object_name,image,message) VALUES (?,?,?,?)""",

@@ -1,0 +1,2 @@
+# LiteRT (TensorFlow Lite) CPU runtime used by Ultralytics for .tflite inference.
+ai-edge-litert>=2.1.4,<3

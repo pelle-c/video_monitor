@@ -25,7 +25,7 @@ def parse_args():
         "--max-bad-frames",
         type=int,
         default=25,
-        help="How many unreadable frames to skip before giving up. Default: 25.",
+        help="Warn after this many unreadable frames; continue skipping them. Default: 25.",
     )
     parser.add_argument(
         "--confidence",
@@ -52,7 +52,12 @@ def parse_args():
     )
     parser.add_argument("--data", help="Dataset YAML with class names, if model metadata is missing.")
     parser.add_argument("--result-json", help="Write a machine-readable result (requires --no-isolation and one video).")
-    parser.add_argument("--threads", type=int, default=1, help="CPU inference threads. Default: 1.")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="CPU inference and Edge TPU CPU-fallback threads. Default: 1.",
+    )
     parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU threshold. Default: 0.7.")
     parser.add_argument(
         "--annotated-dir",
@@ -68,6 +73,11 @@ def parse_args():
         "--no-isolation",
         action="store_true",
         help="Run analysis in the main process instead of a protected child process.",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate that the video opens and a frame near its end can be decoded; do not load a model.",
     )
     parser.add_argument(
         "--self-test",
@@ -86,22 +96,34 @@ def parse_args():
 
 
 def load_model(args):
-    if Path(args.model).suffix.lower() == ".pt":
-        from pytorch_detector import PyTorchDetector
-        return PyTorchDetector(args.model, threads=args.threads, imgsz=args.imgsz, iou=args.iou)
-
-    from tflite_detector import TFLiteDetector
+    model_path = Path(args.model)
+    suffix = model_path.suffix.lower()
+    if suffix not in {".pt", ".tflite"}:
+        raise ValueError(f"Unsupported model format: {suffix or '(no extension)'}; use .pt or .tflite")
 
     try:
-        return TFLiteDetector(
-            args.model, data_path=args.data, threads=args.threads,
-            imgsz=args.imgsz, iou=args.iou,
-        )
+        if suffix == ".tflite":
+            runtime_module = (
+                "tflite_runtime" if "edgetpu" in model_path.name.lower()
+                else "ai_edge_litert"
+            )
+            try:
+                __import__(runtime_module)
+            except ImportError as exc:
+                if runtime_module == "ai_edge_litert":
+                    hint = "Install it with .venv-pi/bin/python -m pip install -r requirements-tflite.txt"
+                else:
+                    hint = "Install it with .venv-pi/bin/python -m pip install -r requirements-edgetpu.txt"
+                raise RuntimeError(f"Missing {runtime_module} for this TFLite model. {hint}.") from exc
+
+        from pytorch_detector import PyTorchDetector
+        return PyTorchDetector(args.model, threads=args.threads, imgsz=args.imgsz,
+                               iou=args.iou, data_path=args.data)
     except Exception as exc:
-        if is_edge_tpu_load_error(args.model, exc):
+        if suffix == ".tflite" and is_edge_tpu_load_error(args.model, exc):
             print_edge_tpu_load_help(args.model, exc)
         else:
-            print(f"Error: Could not load the TFLite model: {exc}")
+            print(f"Error: Could not load model: {exc}")
         raise SystemExit(1) from exc
 
 
@@ -154,17 +176,23 @@ def read_next_frame(cap, bad_frames, max_bad_frames):
     current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if total_frames <= 0 or current_frame >= total_frames:
+    if total_frames > 0 and current_frame >= total_frames:
         return None, bad_frames
 
     bad_frames += 1
-    if bad_frames > max_bad_frames:
+    if bad_frames == max_bad_frames + 1:
         print(
-            "Error: Too many unreadable video frames. The input video may be corrupt."
+            f"Warning: More than {max_bad_frames} unreadable frames; "
+            "continuing analysis and skipping unreadable frames.",
+            flush=True,
         )
-        raise SystemExit(1)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame + 1)
+    requested_frame = current_frame + 1
+    if not cap.set(cv2.CAP_PROP_POS_FRAMES, requested_frame):
+        return None, bad_frames
+    next_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    if next_frame <= current_frame:
+        return None, bad_frames
     return False, bad_frames
 
 
@@ -237,6 +265,18 @@ def save_annotated_object(
     return output_path
 
 
+def save_no_object_frame(frame, video_key, model_key, frame_number, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    filename = (
+        f"{video_key}_no_objects_frame-{frame_number:06d}"
+        f"_model-{model_key}.jpg"
+    )
+    output_path = os.path.join(output_dir, filename)
+    if not cv2.imwrite(output_path, frame):
+        return None
+    return output_path
+
+
 def analyze_video(args):
     started_at = time.perf_counter()
     video_path = args.video_path
@@ -250,6 +290,12 @@ def analyze_video(args):
     analyzed_frames = 0
     last_reported_frames = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    target_frame_index = max(round(fps), 0) if fps > 0 else 0
+    if total_frames > 0:
+        target_frame_index = min(target_frame_index, total_frames - 1)
+    fallback_frame = None
+    fallback_frame_number = None
     annotated_paths = {}
 
     print(f"Analyzing '{video_path}'... Please wait...", flush=True)
@@ -265,6 +311,9 @@ def analyze_video(args):
                 continue
 
             frame_number = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if fallback_frame is None and frame_number - 1 >= target_frame_index:
+                fallback_frame = frame.copy()
+                fallback_frame_number = frame_number
             try:
                 detections = model.detect(frame, confidence=args.confidence)
             except Exception as exc:
@@ -275,7 +324,8 @@ def analyze_video(args):
 
             analyzed_frames += 1
             if analyzed_frames % 10 == 0:
-                total = str(total_frames) if total_frames > 0 else "unknown"
+                total = (str(total_frames) if total_frames >= analyzed_frames
+                         else f"unknown (container reports {total_frames})")
                 print(f"Frames analyzed: {analyzed_frames}/{total}", flush=True)
                 last_reported_frames = analyzed_frames
 
@@ -313,7 +363,8 @@ def analyze_video(args):
         cap.release()
 
     if analyzed_frames != last_reported_frames:
-        total = str(total_frames) if total_frames > 0 else "unknown"
+        total = (str(total_frames) if total_frames >= analyzed_frames
+                 else f"unknown (container reports {total_frames})")
         print(f"Frames analyzed: {analyzed_frames}/{total}", flush=True)
 
     detected_objects = {
@@ -321,6 +372,20 @@ def analyze_video(args):
         for object_name in object_counts
         if object_counts.get(object_name, 0) >= args.min_object_hits
     }
+
+    if not detected_objects and not args.no_save_annotated:
+        if fallback_frame is None:
+            raise RuntimeError("Could not read a frame at or near one second into the video")
+        image_path = save_no_object_frame(
+            fallback_frame,
+            video_key,
+            model_key,
+            fallback_frame_number,
+            args.annotated_dir,
+        )
+        if image_path is None:
+            raise RuntimeError("Could not save the no-object preview image")
+        annotated_paths["no_objects"] = image_path
 
     if not args.no_save_annotated:
         missing_images = detected_objects - annotated_paths.keys()
@@ -370,10 +435,11 @@ def print_result(analysis_result):
         print("No objects met the detection threshold.")
 
     if annotated_paths:
-        print(
-            f"Saved {len(annotated_paths)} annotated object image(s) to "
-            f"'{analysis_result['annotated_dir']}'."
-        )
+        if detected_objects:
+            description = "annotated object image(s)"
+        else:
+            description = "one-second preview image"
+        print(f"Saved {description} to '{analysis_result['annotated_dir']}'.")
 
 
 def run_worker(result_queue, args):
@@ -477,8 +543,39 @@ def run_single(args):
     return 0
 
 
+def validate_video(path):
+    """Reject incomplete/unreadable MP4 snapshots before spending time on inference."""
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            raise ValueError("video container cannot be opened")
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count <= 0:
+            raise ValueError("video reports no frames")
+        # Seeking to the final reported frame checks that the MP4 index reaches
+        # the tail, where an interrupted recording is most likely to be truncated.
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_count - 1))
+        ok, frame = cap.read()
+        if not ok or frame is None or frame.size == 0:
+            raise ValueError("the final indexed video frame cannot be decoded")
+    finally:
+        cap.release()
+
+
 def main():
     args = parse_args()
+
+    if args.validate_only:
+        if not args.video_path or Path(args.video_path).is_dir():
+            print("Error: --validate-only requires one video file.")
+            return 2
+        try:
+            validate_video(args.video_path)
+            print(f"Video is readable: {args.video_path}")
+            return 0
+        except (OSError, ValueError) as exc:
+            print(f"Video is not ready for analysis: {exc}")
+            return 1
 
     if not args.self_test and not args.video_path:
         print("Error: You must provide an MP4 file or folder.")

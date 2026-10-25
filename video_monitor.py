@@ -1,6 +1,7 @@
 """Headless video-to-Signal supervisor; heavy dependencies live in a child process."""
 
 import argparse
+import ctypes.util
 import fcntl
 import importlib.util
 import json
@@ -155,18 +156,20 @@ class Monitor:
                 self.analysis_failed(row, error)
                 return
             try:
-                stat = Path(row["path"]).stat()
-                if file_key(row["path"], stat.st_size, stat.st_mtime_ns) != row["id"]:
+                snapshot = self.job_directory(row) / Path(row["path"]).name
+                if snapshot.stat().st_size != row["size"]:
                     self.store.supersede(row["id"])
                     self.discard_images(row)
-                    LOG.warning("Video changed during analysis: %s", row["path"])
+                    LOG.warning("Video snapshot changed during analysis: %s", row["path"])
                     return
                 result_path = self.job_directory(row) / "result.json"
                 if result_path.stat().st_size > 1024 * 1024:
                     raise ValueError("Analysis result is too large")
                 result = json.loads(result_path.read_text())
                 images = result["annotated_paths"]
-                if not isinstance(images, dict) or set(images) != set(result["detected_objects"]):
+                detected_objects = set(result["detected_objects"])
+                expected_images = detected_objects or {"no_objects"}
+                if not isinstance(images, dict) or set(images) != expected_images:
                     raise ValueError("Missing object images in analysis result")
                 image_root = self.job_directory(row).resolve()
                 for name, image in images.items():
@@ -177,6 +180,7 @@ class Monitor:
                         raise ValueError("Missing or invalid image file")
                 self.store.finish(row["id"], images, Path(row["path"]).name)
                 result_path.unlink(missing_ok=True)
+                snapshot.unlink(missing_ok=True)
                 if not images:
                     self.discard_images(row)
                 LOG.info("Analyzed %s: %d object classes", row["path"], len(images))
@@ -230,10 +234,56 @@ class Monitor:
             return
         self.discard_images(row)
         directory = self.job_directory(row)
-        directory.mkdir()
+        try:
+            directory.mkdir()
+            snapshot = directory / Path(row["path"]).name
+            shutil.copyfile(row["path"], snapshot)
+            copied_size = snapshot.stat().st_size
+            current = Path(row["path"]).stat()
+        except OSError as exc:
+            self.discard_images(row)
+            self.store.defer(row["id"], time.time() + self.config.retry.initial_seconds, str(exc))
+            LOG.warning("Could not snapshot video %s; will retry: %s", row["path"], exc)
+            return
+        if (copied_size != row["size"]
+                or file_key(row["path"], current.st_size, current.st_mtime_ns) != row["id"]):
+            self.store.supersede(row["id"])
+            self.discard_images(row)
+            LOG.warning("Video changed while making snapshot: %s", row["path"])
+            return
+        validator = [sys.executable, "-u", str(Path(__file__).with_name("video_analyzer.py")),
+                     str(snapshot), "--validate-only"]
+        try:
+            checked = subprocess.run(validator, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, timeout=30, cwd=Path(__file__).resolve().parent)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.discard_images(row)
+            self.store.defer(row["id"], time.time() + self.config.retry.initial_seconds,
+                             f"video validation could not complete: {exc}")
+            LOG.warning("Video validation delayed for %s: %s", row["path"], exc)
+            return
+        if checked.returncode != 0:
+            self.discard_images(row)
+            detail = (checked.stdout or "video is not yet readable").strip()[-1000:]
+            self.store.defer(row["id"], time.time() + self.config.retry.initial_seconds, detail)
+            LOG.warning("Video is not ready; will retry %s: %s", row["path"], detail)
+            return
+        try:
+            current = Path(row["path"]).stat()
+        except OSError as exc:
+            self.discard_images(row)
+            self.store.defer(row["id"], time.time() + self.config.retry.initial_seconds, str(exc))
+            LOG.warning("Video unavailable after validation: %s", row["path"])
+            return
+        if file_key(row["path"], current.st_size, current.st_mtime_ns) != row["id"]:
+            self.store.supersede(row["id"])
+            self.discard_images(row)
+            LOG.warning("Video changed during validation: %s", row["path"])
+            return
         cfg = self.config.analysis
         command = [sys.executable, "-u", str(Path(__file__).with_name("video_analyzer.py")),
-                   row["path"], "--no-isolation", "--model", cfg.model,
+                   str(snapshot), "--no-isolation", "--model", cfg.model,
                    "--annotated-dir", str(directory), "--result-json", str(directory / "result.json")]
         for key in ("confidence", "min_object_hits", "max_bad_frames", "threads", "iou"):
             command.extend(["--" + key.replace("_", "-"), str(getattr(cfg, key))])
@@ -280,8 +330,12 @@ class Monitor:
         if self.mount_ok and os.path.ismount(self.root):
             row = self.store.next_job(time.time())
             if row is not None:
-                if self.spool_size() < self.config.storage.max_spool_mb * 1024 * 1024:
+                limit = self.config.storage.max_spool_mb * 1024 * 1024
+                if self.spool_size() + row["size"] <= limit:
                     self.start_analysis(row)
+                else:
+                    self.store.defer(row["id"], time.time() + self.config.retry.initial_seconds,
+                                     "spool limit cannot fit video snapshot")
 
     def run(self):
         LOG.info("Watching %s", self.root)
@@ -302,10 +356,23 @@ class Monitor:
 
 
 def check_runtime(config):
-    backend = "ultralytics" if Path(config.analysis.model).suffix.lower() == ".pt" else "tflite_detector"
-    for name in ("cv2", "numpy", backend):
+    suffix = Path(config.analysis.model).suffix.lower()
+    if suffix not in {".pt", ".tflite"}:
+        raise ConfigError("analysis.model must point to a .pt or .tflite model")
+    for name in ("cv2", "numpy", "ultralytics"):
         if importlib.util.find_spec(name) is None:
             raise ConfigError(f"Missing analysis dependency: {name}")
+    if suffix == ".tflite":
+        is_edgetpu = "edgetpu" in Path(config.analysis.model).name.lower()
+        runtime = "tflite_runtime" if is_edgetpu else "ai_edge_litert"
+        if importlib.util.find_spec(runtime) is None:
+            if runtime == "ai_edge_litert":
+                hint = "Install with .venv-pi/bin/python -m pip install -r requirements-tflite.txt"
+            else:
+                hint = "Install with .venv-pi/bin/python -m pip install -r requirements-edgetpu.txt"
+            raise ConfigError(f"Missing TFLite dependency {runtime}. {hint}.")
+        if is_edgetpu and ctypes.util.find_library("edgetpu") is None:
+            raise ConfigError("Missing libedgetpu. Install the Coral system package libedgetpu1-std.")
     for label, value in (("model", config.analysis.model), ("data", config.analysis.data)):
         if value and not Path(value).is_file():
             raise ConfigError(f"Analysis {label} file not found: {value}")

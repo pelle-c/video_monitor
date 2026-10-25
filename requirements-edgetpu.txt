@@ -1,0 +1,5 @@
+# Coral's Edge TPU delegate and the TensorFlow Lite Python interpreter.
+# tflite-runtime 2.14.0 requires the NumPy 1.x ABI.
+numpy<2.0
+opencv-python-headless==4.11.0.86
+tflite-runtime==2.14.0

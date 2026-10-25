@@ -3,7 +3,8 @@
 Programmet övervakar MP4-filer på en monterad disk, analyserar färdigskrivna
 filer och skickar en annoterad JPG per identifierad **objektklass och video**
 till den konfigurerade Signal-gruppen. Om inga objekt hittas skickas ett
-textmeddelande med videons filnamn. Vid första starten inventeras redan befintliga
+textmeddelande med videons filnamn och en bildruta från en sekund in i videon. Om
+videon är kortare än en sekund används dess sista tillgängliga bildruta. Vid första starten inventeras redan befintliga
 MP4-filer och ignoreras; nya filer som dyker upp efter inventeringen analyseras.
 Inventeringen sparas i SQLite och gäller även efter omstarter.
 
@@ -29,8 +30,84 @@ Ett modelltest utan Signal eller ommontering kan köras med
 `python3 video_analyzer.py --no-isolation --self-test`.
 Analysera en enskild film med `.venv-pi/bin/python video_analyzer.py /sökväg/film.mp4`.
 Analysatorn skriver antal analyserade bildrutor var tionde ruta och när videon är klar.
-TFLite-alternativet kräver den separata modulen `tflite_detector` och dess
-runtime; dessa följer för närvarande inte med projektet.
+
+## Köra en TFLite-modell
+
+Installera LiteRT-runtime i projektets virtuella miljö på Raspberry Pi:n:
+`.venv-pi/bin/python -m pip install -r requirements-tflite.txt`.
+Kör sedan en film direkt med exempelvis:
+
+```sh
+.venv-pi/bin/python video_analyzer.py /sökväg/film.mp4 \
+  --model runs/detect/train-8/weights/best_saved_model/best_float32.tflite
+```
+
+För övervakaren ändrar du `analysis.model` i `config.yaml` till önskad
+`.tflite`-fil; den befintliga standardmodellen ändras inte automatiskt. Ultralytics-
+exporter använder modellens metadata för klassnamn och bildstorlek. För andra
+modeller kan du ange en klassnamnsfil med `analysis.data` eller `--data`.
+Vanliga `.tflite`-filer körs på CPU. Filer med `edgetpu` i namnet
+kräver i stället Coral-installationen nedan.
+
+## Köra en modell på Coral Edge TPU
+
+Pi:n ser redan USB-acceleratorn. För en modell som använder den måste filen vara
+kompilerad för Edge TPU och ha `edgetpu` i filnamnet. Exempelmodellen i projektet
+är `runs/detect/train-4/weights/best_saved_model/best_full_integer_quant_edgetpu.tflite`.
+Installera Python-runtime i `.venv-pi`:
+
+```sh
+.venv-pi/bin/python -m pip install -r requirements-edgetpu.txt
+```
+
+Filen låser NumPy under 2 och OpenCV 4.11 eftersom
+`tflite-runtime 2.14.0` använder NumPy 1.x-ABI:t.
+
+Den lokalt byggda throttled-runtime finns här:
+
+`tools/edge-tpu-build/libedgetpu/out/throttled/k8/libedgetpu.so.1.0`
+
+För att Python ska hitta `libedgetpu.so.1` vid start behöver runtime-katalogen
+finnas i `LD_LIBRARY_PATH`. Ange den för varje kommando som kör Coral-modellen:
+
+```sh
+LD_LIBRARY_PATH=/home/pelle/video_analyzer/tools/edge-tpu-build/libedgetpu/out/throttled/k8 \
+  .venv-pi/bin/python video_analyzer.py /sökväg/film.mp4 \
+  --model runs/detect/train-4/weights/best_saved_model/best_full_integer_quant_edgetpu.tflite
+```
+
+För monitorn används samma miljövariabel:
+
+```sh
+LD_LIBRARY_PATH=/home/pelle/video_analyzer/tools/edge-tpu-build/libedgetpu/out/throttled/k8 \
+  ./run_monitor.sh config.yaml
+```
+
+Detta gäller när runtime-biblioteket ligger i projektets byggkatalog. Om
+`libedgetpu.so.1` i stället installeras i en standardsökväg av systemets
+pakethanterare behövs normalt inte `LD_LIBRARY_PATH`.
+
+Installera sedan Coral-systembiblioteket och udev-regeln på Raspberry Pi:n:
+
+```sh
+sudo install -d -m 755 /etc/apt/keyrings
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/coral-edgetpu.gpg
+echo "deb [signed-by=/etc/apt/keyrings/coral-edgetpu.gpg] https://packages.cloud.google.com/apt coral-edgetpu-stable main" | sudo tee /etc/apt/sources.list.d/coral-edgetpu.list
+sudo apt update
+sudo apt install libedgetpu1-std
+```
+
+Koppla ur och in USB-acceleratorn efter paketinstallationen så att udev-regeln
+aktiveras. Kontrollera att `ldconfig -p` visar `libedgetpu.so.1` och att den
+vanliga användaren kan öppna USB-enheten. Kör en enskild video med:
+
+```sh
+.venv-pi/bin/python video_analyzer.py /sökväg/film.mp4 \
+  --model runs/detect/train-4/weights/best_saved_model/best_full_integer_quant_edgetpu.tflite
+```
+
+För övervakaren anger du samma modellfil i `analysis.model` i `config.yaml`.
+Modeller utan `edgetpu` i namnet körs på CPU även om Coral är ansluten.
 
 `remount.sh` förutsätter en diskavbildning med partition 1 och använder
 `sudo -n` för `umount`, `losetup`, `partx` och `mount`. Användaren som kör
@@ -97,8 +174,8 @@ utgör ett helt argument: `{mountpoint}`, `{image}`, `{message}` respektive `{gr
 | analysis.data | Tom sträng; valfri klassnamnsfil för TFLite |
 | analysis.confidence | 0.45 |
 | analysis.min_object_hits | 3 detektioner per klass |
-| analysis.max_bad_frames | 25 |
-| analysis.threads | 1 |
+| analysis.max_bad_frames | 25; varnar efter tröskeln men fortsätter hoppa över oläsbara bildrutor |
+| analysis.threads | 1; används även för Edge TPU:s CPU-fallback |
 | analysis.iou | 0.7 |
 | analysis.timeout_seconds | 1800 sekunder |
 | analysis.max_attempts | 3 |
@@ -121,6 +198,17 @@ omstarter. Filidentitet bygger på sökväg, storlek och ändringstid. Misslycka
 sändningar försöks igen med exponentiellt ökande väntetid. Bilder tas bort
 först efter lyckad sändning. En processkrasch precis efter att Signal tagit
 emot en bild kan leda till en dubblett vid nästa försök.
+
+Innan analys kopieras MP4-filen till jobbets katalog under `storage.path`. En
+kontroll utan modell verifierar sedan att kopian kan öppnas och att en bild nära
+slutet går att avkoda. Om kontrollen misslyckas väntar jobbet och försöker igen
+utan att förbruka analysens maxförsök. Filens identitet kontrolleras också igen
+efter kopiering och validering. Detta minskar risken att analysera en MP4 medan
+Arlo fortfarande skriver den, men kan inte garantera att hubben har flushat all
+data till disken. Analysen läser den lokala kopian, så pågående inferens är
+oberoende av USB-mounten. Kopian tas bort när analysen är klar; spoolgränsen
+räknar även med videokopian, så stora filer kan få vänta tills lagringsutrymme
+finns.
 
 Fel loggas till standardfel. Efter tre misslyckade analysförsök markeras filmen
 som misslyckad; ändrad filidentitet skapar ett nytt jobb. SIGINT/SIGTERM stoppar
