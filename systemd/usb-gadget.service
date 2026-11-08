@@ -1,5 +1,5 @@
 [Unit]
-Description=Starta virtuell USB-hårddisk via ConfigFS
+Description=Start virtual USB hard disk via ConfigFS
 After=multi-user.target
 
 [Service]

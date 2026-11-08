@@ -1,29 +1,29 @@
 #!/bin/bash
 
-# 1. Ladda nödvändiga kärnmoduler
+# 1. Load required kernel modules
 modprobe configfs
 modprobe libcomposite
 sleep 0.5
 
-# 2. Skapa loop-enheten om den inte redan är aktiv
+# 2. Create the loop device if it is not already active
 if ! losetup -a | grep -q "virtual_disk.img"; then
     echo "Skapar virtuell loop-enhet..."
     losetup -fP /video/virtual_disk.img
 fi
 
-# NY DEBIAN 12 SÄKRING: Hämta enheten via losetup -j (ger garanterat rätt /dev/loopX-sökväg)
+# DEBIAN 12 SAFEGUARD: Get the device via losetup -j (guarantees the correct /dev/loopX path)
 LOOP_DEV=$(losetup -j /video/virtual_disk.img | awk -F: '{print $1}')
 
 if [ -z "$LOOP_DEV" ]; then
-    echo "ERROR: Kunde inte hitta loop-enhet!"
+    echo "ERROR: Could not find loop device!"
     exit 1
 fi
-echo "Använder virtuell enhet: $LOOP_DEV"
+echo "Using virtual device: $LOOP_DEV"
 
-# 3. Gå till ConfigFS och städa om g1 redan existerar
+# 3. Go to ConfigFS and clean up if g1 already exists
 cd /sys/kernel/config/usb_gadget/ || exit 1
 if [ -d "g1" ]; then
-    echo "Städar gammal konfiguration..."
+    echo "Cleaning up old configuration..."
     echo "" > g1/UDC 2>/dev/null
     rm -f g1/configs/c.1/mass_storage.usb0 2>/dev/null
     rmdir g1/configs/c.1/strings/0x409 2>/dev/null
@@ -38,7 +38,7 @@ fi
 mkdir -p g1
 cd g1 || exit 1
 
-# 5. Sätt standard USB-ID
+# 5. Set default USB ID
 echo "0x7614" > idVendor
 echo "0x1000" > idProduct
 echo "0x0100" > bcdDevice
@@ -63,19 +63,19 @@ echo "0" > functions/mass_storage.usb0/lun.0/ro
 echo "0" > functions/mass_storage.usb0/lun.0/cdrom
 echo "0" > functions/mass_storage.usb0/lun.0/nofua
 
-# Skriv den verifierade loop-sökvägen
+# Write the verified loop path
 echo "$LOOP_DEV" > functions/mass_storage.usb0/lun.0/file
 
-# 8. Länka funktionen till konfigurationen
+# 8. Link the function to the configuration
 ln -sf functions/mass_storage.usb0 configs/c.1/
 
-# 9. Hitta rätt UDC-namn och aktivera hårdvaran
+# 9. Find the correct UDC name and activate the hardware
 sleep 0.5
 UDC_NAME=$(ls /sys/class/udc | head -n 1)
 
 if [ -n "$UDC_NAME" ]; then
-    echo "Aktiverar USB på kontroller: $UDC_NAME"
+    echo "Enabling USB on controller: $UDC_NAME"
     echo "$UDC_NAME" > UDC
 else
-    echo "ERROR: Hittade ingen USB Device Controller (UDC)!"
+    echo "ERROR: No USB Device Controller (UDC) found!"
 fi
